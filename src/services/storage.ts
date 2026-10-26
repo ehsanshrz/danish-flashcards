@@ -28,6 +28,16 @@ export function loadCards(): Flashcard[] {
   return normalizeCards(stored)
 }
 
+/** Parses a raw localStorage value (e.g. from a cross-tab `storage` event) into cards. */
+export function parseStoredCards(raw: string | null): Flashcard[] {
+  if (!raw) return []
+  try {
+    return normalizeCards(JSON.parse(raw))
+  } catch {
+    return []
+  }
+}
+
 export function saveCards(cards: Flashcard[]): void {
   write(CARDS_KEY, cards)
 }

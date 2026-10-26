@@ -9,6 +9,7 @@ import {
   findDeckGist,
   mergeDecks,
   parseDeck,
+  pushDeck,
   serializeDeck,
   syncDeck,
   updateDeckGist,
@@ -178,5 +179,31 @@ describe('syncDeck', () => {
       .mockResolvedValueOnce(jsonResponse({ id: 'fresh', files: {} }, 201))
 
     await expect(syncDeck(TOKEN, [], 'gone')).resolves.toMatchObject({ gistId: 'fresh', created: true })
+  })
+})
+
+describe('pushDeck', () => {
+  it('merges with the latest remote deck before patching so other devices\' progress is kept', async () => {
+    const remote = [card({ id: 'a', status: 'mastered', updatedAt: 10 }), card({ id: 'remote-only', updatedAt: 3 })]
+    const local = [card({ id: 'a', status: 'learning', updatedAt: 1 }), card({ id: 'b', status: 'learning', updatedAt: 20 })]
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(gistWith('abc', remote)))
+      .mockResolvedValueOnce(jsonResponse({ id: 'abc', files: {} }))
+
+    const merged = await pushDeck(TOKEN, 'abc', local)
+    expect(merged.map((c) => [c.id, c.status])).toEqual([
+      ['a', 'mastered'],
+      ['remote-only', 'new'],
+      ['b', 'learning'],
+    ])
+    const patched = parseDeck(JSON.parse(fetchMock.mock.calls[1][1].body as string).files[GIST_FILENAME].content)
+    expect(patched).toEqual(merged)
+  })
+
+  it('skips the PATCH when the remote deck already matches', async () => {
+    const cards = [card({ id: 'a', updatedAt: 5 })]
+    fetchMock.mockResolvedValueOnce(jsonResponse(gistWith('abc', cards)))
+    await expect(pushDeck(TOKEN, 'abc', cards)).resolves.toEqual(cards)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 })

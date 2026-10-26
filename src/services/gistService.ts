@@ -163,6 +163,19 @@ export async function updateDeckGist(token: string, gistId: string, cards: Flash
   })
 }
 
+/**
+ * Safely pushes local changes: pulls the current remote deck, merges it with the local one
+ * and only PATCHes when the merge differs from what is stored remotely. Returns the merged deck.
+ */
+export async function pushDeck(token: string, gistId: string, localCards: Flashcard[]): Promise<Flashcard[]> {
+  const remote = await fetchDeck(token, gistId)
+  const merged = mergeDecks(localCards, remote)
+  if (!decksEqual(merged, remote)) {
+    await updateDeckGist(token, gistId, merged)
+  }
+  return merged
+}
+
 export interface SyncResult {
   gistId: string
   cards: Flashcard[]

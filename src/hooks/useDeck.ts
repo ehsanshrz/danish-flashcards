@@ -1,15 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { decksEqual, getAuthenticatedUser, mergeDecks, pushDeck, syncDeck } from '../services/gistService'
 import {
-  decksEqual,
-  getAuthenticatedUser,
-  mergeDecks,
-  syncDeck,
-  updateDeckGist,
-} from '../services/gistService'
-import {
+  CARDS_KEY,
   clearGitHubConfig,
   loadCards,
   loadGitHubConfig,
+  parseStoredCards,
   saveCards,
   saveGitHubConfig,
 } from '../services/storage'
@@ -36,7 +32,8 @@ export function useDeck() {
   const cardsRef = useRef(cards)
   const configRef = useRef(config)
   const pushTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const pushQueue = useRef<Promise<void>>(Promise.resolve())
+  const syncQueue = useRef<Promise<void>>(Promise.resolve())
+  const schedulePushRef = useRef<() => void>(() => {})
   const initialSyncStarted = useRef(false)
 
   useEffect(() => {
@@ -51,26 +48,46 @@ export function useDeck() {
     else clearGitHubConfig()
   }, [])
 
-  const push = useCallback(() => {
-    pushQueue.current = pushQueue.current.then(async () => {
-      const current = configRef.current
-      if (!current?.gistId) return
-      setSyncStatus('syncing')
-      try {
-        await updateDeckGist(current.token, current.gistId, cardsRef.current)
-        if (configRef.current === current) {
+  /** Runs remote operations one at a time so pulls and pushes never interleave. */
+  const enqueue = useCallback(<T,>(task: () => Promise<T>): Promise<T> => {
+    const result = syncQueue.current.then(task)
+    syncQueue.current = result.then(
+      () => undefined,
+      () => undefined,
+    )
+    return result
+  }, [])
+
+  /** Applies a remote deck while preserving local edits made during the request. */
+  const applyRemoteCards = useCallback((remote: Flashcard[]) => {
+    const merged = mergeDecks(cardsRef.current, remote)
+    if (!decksEqual(merged, cardsRef.current)) {
+      cardsRef.current = merged
+      setCards(merged)
+    }
+    if (!decksEqual(merged, remote)) schedulePushRef.current()
+  }, [])
+
+  const push = useCallback(
+    () =>
+      enqueue(async () => {
+        const current = configRef.current
+        if (!current?.gistId) return
+        setSyncStatus('syncing')
+        try {
+          const merged = await pushDeck(current.token, current.gistId, cardsRef.current)
+          if (configRef.current !== current) return
           setSyncStatus('synced')
           setSyncError(null)
-        }
-      } catch (error) {
-        if (configRef.current === current) {
+          applyRemoteCards(merged)
+        } catch (error) {
+          if (configRef.current !== current) return
           setSyncStatus('error')
           setSyncError(errorMessage(error))
         }
-      }
-    })
-    return pushQueue.current
-  }, [])
+      }),
+    [applyRemoteCards, enqueue],
+  )
 
   const schedulePush = useCallback(() => {
     if (!configRef.current?.gistId) return
@@ -82,35 +99,44 @@ export function useDeck() {
     }, PUSH_DEBOUNCE_MS)
   }, [push])
 
-  /** Applies the result of a full sync while preserving any edits made during the request. */
-  const applySyncedCards = useCallback(
-    (synced: Flashcard[]) => {
-      const merged = mergeDecks(cardsRef.current, synced)
-      cardsRef.current = merged
-      setCards(merged)
-      if (!decksEqual(merged, synced)) schedulePush()
-    },
-    [schedulePush],
-  )
+  useEffect(() => {
+    schedulePushRef.current = schedulePush
+  }, [schedulePush])
 
   const runSync = useCallback(
-    async (current: GitHubConfig) => {
-      setSyncStatus('syncing')
-      setSyncError(null)
-      try {
-        const result = await syncDeck(current.token, cardsRef.current, current.gistId)
+    (current: GitHubConfig) =>
+      enqueue(async () => {
         if (configRef.current?.token !== current.token) return
-        updateConfig({ ...current, gistId: result.gistId })
-        setSyncStatus('synced')
-        applySyncedCards(result.cards)
-      } catch (error) {
-        if (configRef.current?.token !== current.token) return
-        setSyncStatus('error')
-        setSyncError(errorMessage(error))
-      }
-    },
-    [applySyncedCards, updateConfig],
+        setSyncStatus('syncing')
+        setSyncError(null)
+        try {
+          const result = await syncDeck(current.token, cardsRef.current, configRef.current?.gistId)
+          if (configRef.current?.token !== current.token) return
+          updateConfig({ ...current, gistId: result.gistId })
+          setSyncStatus('synced')
+          applyRemoteCards(result.cards)
+        } catch (error) {
+          if (configRef.current?.token !== current.token) return
+          setSyncStatus('error')
+          setSyncError(errorMessage(error))
+        }
+      }),
+    [applyRemoteCards, enqueue, updateConfig],
   )
+
+  // Merge edits made in other tabs of this browser so neither tab overwrites the other.
+  useEffect(() => {
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key !== CARDS_KEY || event.newValue === null) return
+      const merged = mergeDecks(parseStoredCards(event.newValue), cardsRef.current)
+      if (!decksEqual(merged, cardsRef.current)) {
+        cardsRef.current = merged
+        setCards(merged)
+      }
+    }
+    window.addEventListener('storage', handleStorage)
+    return () => window.removeEventListener('storage', handleStorage)
+  }, [])
 
   // Pull the latest remote state once on startup if a token is already stored.
   useEffect(() => {
@@ -137,22 +163,23 @@ export function useDeck() {
 
   /** Validates the token, then finds/creates the deck gist and syncs. Throws on failure. */
   const connect = useCallback(
-    async (token: string) => {
-      const previous = configRef.current
-      setSyncStatus('syncing')
-      setSyncError(null)
-      try {
-        const username = await getAuthenticatedUser(token)
-        const result = await syncDeck(token, cardsRef.current)
-        updateConfig({ token, username, gistId: result.gistId })
-        setSyncStatus('synced')
-        applySyncedCards(result.cards)
-      } catch (error) {
-        setSyncStatus(previous ? 'error' : 'offline')
-        throw error
-      }
-    },
-    [applySyncedCards, updateConfig],
+    (token: string) =>
+      enqueue(async () => {
+        const previous = configRef.current
+        setSyncStatus('syncing')
+        setSyncError(null)
+        try {
+          const username = await getAuthenticatedUser(token)
+          const result = await syncDeck(token, cardsRef.current)
+          updateConfig({ token, username, gistId: result.gistId })
+          setSyncStatus('synced')
+          applyRemoteCards(result.cards)
+        } catch (error) {
+          setSyncStatus(previous ? 'error' : 'offline')
+          throw error
+        }
+      }),
+    [applyRemoteCards, enqueue, updateConfig],
   )
 
   const disconnect = useCallback(() => {
