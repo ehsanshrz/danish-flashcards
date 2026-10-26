@@ -38,6 +38,12 @@ npm run lint     # lint (oxlint)
 npm run build    # type-check and build for production
 ```
 
+## Deploying to GitHub Pages
+
+The workflow in `.github/workflows/deploy.yml` builds the app and deploys the generated `dist` directory to GitHub Pages
+when changes are pushed to `main`. In the repository settings, set **Pages → Build and deployment → Source** to
+**GitHub Actions**.
+
 ## GitHub sync
 
 1. Create a token at <https://github.com/settings/tokens/new?scopes=gist> (classic token with the `gist` scope, or a
